@@ -157,7 +157,6 @@ struct Device {
 }
 
 struct SwitchConfig {
-    name: String,
     unique_id: String,
     command_topic: String,
     state_topic: String,
@@ -175,8 +174,7 @@ impl SwitchConfig {
         let dev = &self.device;
         let identifier = dev.identifiers.first().cloned().unwrap_or_default();
         format!(
-            "{{\"name\":\"{name}\",\"unique_id\":\"{unique_id}\",\"command_topic\":\"{command}\",\"state_topic\":\"{state}\",\"availability_topic\":\"{availability}\",\"payload_on\":\"{payload_on}\",\"payload_off\":\"{payload_off}\",\"state_on\":\"{state_on}\",\"state_off\":\"{state_off}\",\"icon\":\"{icon}\",\"device\":{{\"identifiers\":[\"{identifier}\"],\"name\":\"{dev_name}\",\"manufacturer\":\"{manufacturer}\",\"model\":\"{model}\",\"sw_version\":\"{sw_version}\"}}}}",
-            name = self.name,
+            "{{\"unique_id\":\"{unique_id}\",\"command_topic\":\"{command}\",\"state_topic\":\"{state}\",\"availability_topic\":\"{availability}\",\"payload_on\":\"{payload_on}\",\"payload_off\":\"{payload_off}\",\"state_on\":\"{state_on}\",\"state_off\":\"{state_off}\",\"icon\":\"{icon}\",\"device\":{{\"identifiers\":[\"{identifier}\"],\"name\":\"{dev_name}\",\"manufacturer\":\"{manufacturer}\",\"model\":\"{model}\",\"sw_version\":\"{sw_version}\"}}}}",
             unique_id = self.unique_id,
             command = self.command_topic,
             state = self.state_topic,
@@ -286,7 +284,6 @@ async fn main() -> Result<()> {
 
     // Build discovery config
     let cfg = SwitchConfig {
-        name: args.friendly_name.clone(),
         unique_id: format!("{}_{}", args.device_id, switch_object_id),
         command_topic: command_topic.clone(),
         state_topic: state_topic.clone(),
