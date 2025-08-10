@@ -213,6 +213,7 @@ fn random_suffix(n: usize) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
     info!("Starting with args: {:?}", args);
 
