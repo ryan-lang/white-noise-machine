@@ -2,58 +2,83 @@
 // Cargo (add these to Cargo.toml):
 // [dependencies]
 // anyhow = "1"
-// clap = { version = "4", features = ["derive"] }
-// env_logger = "0.11"
+// clap = { version = "4" }
 // log = "0.4"
 // rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
-// serde = { version = "1", features = ["derive"] }
-// serde_json = "1"
-// tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "process"] }
-// rand = "0.8"
+// tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+// rand = "0.9"
 
-use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use anyhow::{anyhow, Context, Result};
+use clap::{Arg, Command as ClapCommand};
 use log::{debug, error, info, warn};
-use rand::{Rng, distributions::Alphanumeric};
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Outgoing, QoS};
-use serde::Serialize;
+use rand::{distr::Alphanumeric, Rng};
+use rumqttc::{AsyncClient, Event, MqttOptions, Outgoing, QoS};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::signal;
 use tokio::time::sleep;
 
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "ha-white-noise",
-    author,
-    version,
-    about = "Home Assistant MQTT white-noise switch"
-)]
+#[derive(Debug, Clone)]
 struct Args {
-    /// Path to the MP3 to loop
-    #[arg(long)]
     mp3_path: String,
-
-    /// Friendly name for the device in Home Assistant
-    #[arg(long)]
     friendly_name: String,
-
-    /// Stable device ID (used for discovery identifiers / topics)
-    #[arg(long)]
     device_id: String,
-
-    /// MQTT server (host[:port], default port 1883 if omitted)
-    #[arg(long)]
     mqtt_server: String,
-
-    /// MQTT username (optional)
-    #[arg(long)]
     mqtt_username: Option<String>,
-
-    /// MQTT password (optional)
-    #[arg(long)]
     mqtt_password: Option<String>,
+}
+
+impl Args {
+    fn parse() -> Self {
+        let matches = ClapCommand::new("ha-white-noise")
+            .arg(
+                Arg::new("mp3_path")
+                    .long("mp3_path")
+                    .value_name("PATH")
+                    .required(true),
+            )
+            .arg(
+                Arg::new("friendly_name")
+                    .long("friendly_name")
+                    .value_name("NAME")
+                    .required(true),
+            )
+            .arg(
+                Arg::new("device_id")
+                    .long("device_id")
+                    .value_name("ID")
+                    .required(true),
+            )
+            .arg(
+                Arg::new("mqtt_server")
+                    .long("mqtt_server")
+                    .value_name("HOST")
+                    .required(true),
+            )
+            .arg(
+                Arg::new("mqtt_username")
+                    .long("mqtt_username")
+                    .value_name("USER"),
+            )
+            .arg(
+                Arg::new("mqtt_password")
+                    .long("mqtt_password")
+                    .value_name("PASS"),
+            )
+            .get_matches();
+
+        Args {
+            mp3_path: matches.get_one::<String>("mp3_path").unwrap().to_owned(),
+            friendly_name: matches
+                .get_one::<String>("friendly_name")
+                .unwrap()
+                .to_owned(),
+            device_id: matches.get_one::<String>("device_id").unwrap().to_owned(),
+            mqtt_server: matches.get_one::<String>("mqtt_server").unwrap().to_owned(),
+            mqtt_username: matches.get_one::<String>("mqtt_username").cloned(),
+            mqtt_password: matches.get_one::<String>("mqtt_password").cloned(),
+        }
+    }
 }
 
 struct Player {
@@ -111,35 +136,10 @@ impl Player {
     fn stop(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
             info!("Stopping mpg123 (PID {})", child.id());
-            // Try graceful kill first
-            #[cfg(unix)]
-            {
-                use nix::sys::signal::{Signal, kill};
-                use nix::unistd::Pid;
-                if let Err(e) = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM) {
-                    warn!("SIGTERM to mpg123 failed: {e}");
-                }
+            // Attempt to terminate the process. If this fails, fall back to force kill.
+            if child.kill().is_err() {
+                warn!("Failed to send kill signal to mpg123");
             }
-
-            // Wait a bit, then force kill if still alive
-            for _ in 0..10 {
-                match child.try_wait() {
-                    Ok(Some(_status)) => {
-                        info!("mpg123 exited");
-                        return Ok(());
-                    }
-                    Ok(None) => {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        warn!("try_wait while stopping: {e}");
-                        break;
-                    }
-                }
-            }
-
-            warn!("Forcing kill of mpg123");
-            let _ = child.kill();
             let _ = child.wait();
         } else {
             debug!("stop requested, but no running mpg123 child");
@@ -148,7 +148,6 @@ impl Player {
     }
 }
 
-#[derive(Serialize)]
 struct Device {
     identifiers: Vec<String>,
     name: String,
@@ -157,7 +156,6 @@ struct Device {
     sw_version: String,
 }
 
-#[derive(Serialize)]
 struct SwitchConfig {
     name: String,
     unique_id: String,
@@ -172,6 +170,31 @@ struct SwitchConfig {
     device: Device,
 }
 
+impl SwitchConfig {
+    fn to_json(&self) -> String {
+        let dev = &self.device;
+        let identifier = dev.identifiers.first().cloned().unwrap_or_default();
+        format!(
+            "{{\"name\":\"{name}\",\"unique_id\":\"{unique_id}\",\"command_topic\":\"{command}\",\"state_topic\":\"{state}\",\"availability_topic\":\"{availability}\",\"payload_on\":\"{payload_on}\",\"payload_off\":\"{payload_off}\",\"state_on\":\"{state_on}\",\"state_off\":\"{state_off}\",\"icon\":\"{icon}\",\"device\":{{\"identifiers\":[\"{identifier}\"],\"name\":\"{dev_name}\",\"manufacturer\":\"{manufacturer}\",\"model\":\"{model}\",\"sw_version\":\"{sw_version}\"}}}}",
+            name = self.name,
+            unique_id = self.unique_id,
+            command = self.command_topic,
+            state = self.state_topic,
+            availability = self.availability_topic,
+            payload_on = self.payload_on,
+            payload_off = self.payload_off,
+            state_on = self.state_on,
+            state_off = self.state_off,
+            icon = self.icon,
+            identifier = identifier,
+            dev_name = dev.name,
+            manufacturer = dev.manufacturer,
+            model = dev.model,
+            sw_version = dev.sw_version,
+        )
+    }
+}
+
 fn parse_host_port(s: &str) -> (String, u16) {
     if let Some((h, p)) = s.rsplit_once(':') {
         if let Ok(port) = p.parse::<u16>() {
@@ -182,8 +205,9 @@ fn parse_host_port(s: &str) -> (String, u16) {
 }
 
 fn random_suffix(n: usize) -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
+    let mut rng = rand::rng();
+    (&mut rng)
+        .sample_iter(Alphanumeric)
         .take(n)
         .map(char::from)
         .collect()
@@ -191,7 +215,6 @@ fn random_suffix(n: usize) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
     let args = Args::parse();
     info!("Starting with args: {:?}", args);
 
@@ -281,7 +304,7 @@ async fn main() -> Result<()> {
             sw_version: env!("CARGO_PKG_VERSION").into(),
         },
     };
-    let cfg_json = serde_json::to_string(&cfg)?;
+    let cfg_json = cfg.to_json();
 
     // A shared player
     let player = Arc::new(Mutex::new(Player::new()));
@@ -290,7 +313,6 @@ async fn main() -> Result<()> {
     // We’ll drive the event loop in a separate task and interact via channels.
     // But for simplicity, we’ll just run the loop inline here.
     // When connected, publish discovery + availability + initial state.
-    let mut connected = false;
 
     // Subscribe once after (first) connect
     let mut subscribed = false;
@@ -305,7 +327,6 @@ async fn main() -> Result<()> {
                 match incoming {
                     ConnAck(_) => {
                         info!("Connected to MQTT broker");
-                        connected = true;
 
                         // Online
                         pub_retained(&client, &availability_topic, "online").await?;
@@ -374,63 +395,12 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 error!("MQTT event loop error: {e:#}");
-                connected = false;
                 // Backoff to avoid hot loop
                 sleep(Duration::from_secs(2)).await;
             }
         }
-
-        // Graceful shutdown on SIGINT/SIGTERM (non-blocking check)
-        if connected {
-            if let Ok(Some(_)) = signal::ctrl_c().now_or_never().transpose() {
-                info!("Received Ctrl-C, shutting down...");
-                // Publish offline and stop player
-                let _ = pub_retained(&client, &availability_topic, "offline").await;
-                {
-                    let mut pl = player.lock().unwrap();
-                    let _ = pl.stop();
-                }
-                // Allow broker flush
-                sleep(Duration::from_millis(200)).await;
-                break;
-            }
-            // On Linux, also listen to SIGTERM in a background task once (best-effort)
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{SignalKind, signal};
-                static mut TERM_SET: bool = false;
-                unsafe {
-                    if !TERM_SET {
-                        TERM_SET = true;
-                        let client2 = client.clone();
-                        let availability_topic2 = availability_topic.clone();
-                        let player2 = player.clone();
-                        tokio::spawn(async move {
-                            if let Ok(mut s) = signal(SignalKind::terminate()) {
-                                s.recv().await;
-                                info!("Received SIGTERM, shutting down...");
-                                let _ = client2
-                                    .publish(
-                                        &availability_topic2,
-                                        QoS::AtLeastOnce,
-                                        true,
-                                        "offline",
-                                    )
-                                    .await;
-                                {
-                                    let mut pl = player2.lock().unwrap();
-                                    let _ = pl.stop();
-                                }
-                                // Give a moment to flush
-                                sleep(Duration::from_millis(200)).await;
-                                std::process::exit(0);
-                            }
-                        });
-                    }
-                }
-            }
-        }
     }
 
+    #[allow(unreachable_code)]
     Ok(())
 }
