@@ -115,34 +115,42 @@ impl Player {
             info!("mpg123 already running; ignoring start");
             return Ok(());
         }
-        // Spawn mpg123 looping forever, quiet mode
-        // --loop -1 loops indefinitely; -q suppresses stdout; -Z would shuffle (not needed)
-        let child = Command::new("mpg123")
-            .arg("-q")
-            .arg("--loop")
-            .arg("-1")
-            .arg(mp3_path)
+        // Pipe mpg123 through aplay to support ALSA multi-device output
+        // mpg123 decodes to raw audio, aplay plays to all_speakers device
+        let cmd = format!(
+            "while true; do mpg123 -s -r 48000 --stereo '{}' 2>/dev/null | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null; done",
+            mp3_path
+        );
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| "failed to spawn mpg123 (is it installed?)")?;
+            .with_context(|| "failed to spawn mpg123|aplay pipeline")?;
 
-        info!("Started mpg123 (PID {})", child.id());
+        info!("Started audio pipeline (PID {})", child.id());
         self.child = Some(child);
         Ok(())
     }
 
     fn stop(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
-            info!("Stopping mpg123 (PID {})", child.id());
-            // Attempt to terminate the process. If this fails, fall back to force kill.
+            let pid = child.id();
+            info!("Stopping audio pipeline (PID {})", pid);
+            // Kill all child processes of the shell first
+            let _ = Command::new("pkill")
+                .arg("-P")
+                .arg(pid.to_string())
+                .status();
+            // Then kill the shell itself
             if child.kill().is_err() {
-                warn!("Failed to send kill signal to mpg123");
+                warn!("Failed to send kill signal to shell");
             }
             let _ = child.wait();
         } else {
-            debug!("stop requested, but no running mpg123 child");
+            debug!("stop requested, but no running audio pipeline");
         }
         Ok(())
     }
