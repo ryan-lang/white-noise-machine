@@ -115,19 +115,19 @@ impl Player {
             info!("mpg123 already running; ignoring start");
             return Ok(());
         }
-        // Two-phase audio pipeline:
+        // Two-phase audio pipeline fed into a single aplay process:
         //   Phase 1: first play fades in over 3 seconds via sox
         //   Phase 2: subsequent loops play at full volume (no sox overhead)
+        // A subshell groups the decode stages so aplay sees one continuous stream.
         let cmd = format!(
             concat!(
-                "mpg123 -s -r 48000 --stereo '{}' 2>/dev/null",
+                "(mpg123 -s -r 48000 --stereo '{}' 2>/dev/null",
                 " | sox -t raw -r 48000 -c 2 -e signed-integer -b 16 -L -",
-                " -t raw -e signed-integer -b 16 -L - fade t 3",
-                " | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null;",
+                " -t raw -e signed-integer -b 16 -L - fade t 3;",
                 " while true; do",
-                " mpg123 -s -r 48000 --stereo '{}' 2>/dev/null",
-                " | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null;",
-                " done"
+                " mpg123 -s -r 48000 --stereo '{}' 2>/dev/null;",
+                " done)",
+                " | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null"
             ),
             mp3_path, mp3_path
         );
