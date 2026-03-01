@@ -115,11 +115,21 @@ impl Player {
             info!("mpg123 already running; ignoring start");
             return Ok(());
         }
-        // Pipe mpg123 through aplay to support ALSA multi-device output
-        // mpg123 decodes to raw audio, aplay plays to all_speakers device
+        // Two-phase audio pipeline:
+        //   Phase 1: first play fades in over 3 seconds via sox
+        //   Phase 2: subsequent loops play at full volume (no sox overhead)
         let cmd = format!(
-            "while true; do mpg123 -s -r 48000 --stereo '{}' 2>/dev/null | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null; done",
-            mp3_path
+            concat!(
+                "mpg123 -s -r 48000 --stereo '{}' 2>/dev/null",
+                " | sox -t raw -r 48000 -c 2 -e signed-integer -b 16 -L -",
+                " -t raw -e signed-integer -b 16 -L - fade t 3",
+                " | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null;",
+                " while true; do",
+                " mpg123 -s -r 48000 --stereo '{}' 2>/dev/null",
+                " | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null;",
+                " done"
+            ),
+            mp3_path, mp3_path
         );
         let child = Command::new("sh")
             .arg("-c")
@@ -130,7 +140,7 @@ impl Player {
             .spawn()
             .with_context(|| "failed to spawn mpg123|aplay pipeline")?;
 
-        info!("Started audio pipeline (PID {})", child.id());
+        info!("Started audio pipeline with fade-in (PID {})", child.id());
         self.child = Some(child);
         Ok(())
     }
@@ -236,6 +246,21 @@ async fn main() -> Result<()> {
         _ => {
             return Err(anyhow!(
                 "mpg123 was not found in PATH. Install it (e.g. `sudo apt install mpg123`)."
+            ));
+        }
+    }
+
+    // Quick pre-flight: ensure sox is available (used for fade-in)
+    let which_sox = Command::new("which")
+        .arg("sox")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match which_sox {
+        Ok(st) if st.success() => debug!("sox found"),
+        _ => {
+            return Err(anyhow!(
+                "sox was not found in PATH. Install it (e.g. `sudo apt install sox`)."
             ));
         }
     }
