@@ -74,6 +74,10 @@ def main():
         raise RuntimeError("An unknown volume override already exists; investigate first")
     if sha(binary) != "98a4e9705517cbe952578932db96f30c0513f66697c19744b849535949b1df7d":
         raise RuntimeError("Unexpected deployed baseline; refusing replacement")
+    if host == "nightstand-masterbedroom":
+        # A running idle controller can hide a USB disconnect since its last
+        # startup. Check the existing identity gate before stopping it.
+        run("/usr/local/libexec/nightstand-audio-verify", "--identify")
     run("systemctl", "is-active", "--quiet", "white-noise.service")
     idle()
     if retained(base + "/state") != "OFF":

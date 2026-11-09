@@ -32,7 +32,7 @@ error-handling fixes are retained. Firefly's separate graceful-OFF adapter at
 `/usr/local/libexec/firefly-noise/aplay` and host ALSA/systemd configuration are
 not part of this repository and must remain in place on that host.
 
-## Optional durable white-noise volume (not activated on live hosts)
+## Optional durable white-noise volume
 
 `--volume_state_file /var/lib/white-noise-machine/volume.json` opts into a
 noise-only PCM gain stage between the existing decoder/fade and `aplay`.
@@ -81,6 +81,22 @@ host's service identity, room topics, current routing/gains, media, and Firefly'
 graceful-stop PATH adapter. Commission one room at a time, initially at unchanged
 100%, then verify attenuation, restoration, OFF-time changes, continuity, and
 camera/music independence with explicit approval before advancing.
+
+Use `scripts/activate-volume.py` only in that approved window. It requires the
+known baseline binary, an idle player, complete staged artifacts, matching
+checksums and, for Nightstand, its existing USB identity check **before** stopping
+the old controller. It validates a candidate unit, preserves recovery evidence,
+checks fresh online/OFF/100% telemetry, and restores previous files on failure.
+It does not bypass host hardware checks or send playback commands. A missing
+device can prevent even the restored old service from starting; treat that as
+a blocked deployment, not a successful rollback.
+
+On 2026-11-09, this volume implementation was activated on Firefly only; its
+saved setting was verified across an idle controller restart and restored to
+100%, with playback left OFF. Nightstand was restored to its old files but
+remains stopped because its expected NightstandA USB device is missing. See
+`home-infra-inventory/ansible/WHITE-NOISE-VOLUME.md` for exact releases, backups,
+commissioning evidence and the outstanding hardware/audible checks.
 
 ### Safe validation
 
