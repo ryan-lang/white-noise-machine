@@ -17,6 +17,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
+mod volume;
 
 #[derive(Debug, Clone)]
 struct Args {
@@ -24,6 +25,8 @@ struct Args {
     friendly_name: String,
     device_id: String,
     mqtt_server: String,
+    topic_base: String,
+    volume_state_file: Option<String>,
     mqtt_username: Option<String>,
     mqtt_password: Option<String>,
 }
@@ -65,6 +68,21 @@ impl Args {
                     .long("mqtt_password")
                     .value_name("PASS"),
             )
+            .arg(
+                Arg::new("topic_base")
+                    .long("topic_base")
+                    .value_name("TOPIC")
+                    .required(true)
+                    .value_parser([
+                        "appliances/white-noise/florencesroom",
+                        "appliances/white-noise/masterbedroom",
+                    ]),
+            )
+            .arg(
+                Arg::new("volume_state_file")
+                    .long("volume_state_file")
+                    .value_name("PATH"),
+            )
             .get_matches();
 
         Args {
@@ -75,6 +93,8 @@ impl Args {
                 .to_owned(),
             device_id: matches.get_one::<String>("device_id").unwrap().to_owned(),
             mqtt_server: matches.get_one::<String>("mqtt_server").unwrap().to_owned(),
+            topic_base: matches.get_one::<String>("topic_base").unwrap().to_owned(),
+            volume_state_file: matches.get_one::<String>("volume_state_file").cloned(),
             mqtt_username: matches.get_one::<String>("mqtt_username").cloned(),
             mqtt_password: matches.get_one::<String>("mqtt_password").cloned(),
         }
@@ -110,39 +130,70 @@ impl Player {
         }
     }
 
-    fn start(&mut self, mp3_path: &str) -> Result<()> {
+    fn start(&mut self, mp3_path: &str, volume_state_file: Option<&str>) -> Result<()> {
         if self.is_running() {
             info!("mpg123 already running; ignoring start");
             return Ok(());
         }
-        // Spawn mpg123 looping forever, quiet mode
-        // --loop -1 loops indefinitely; -q suppresses stdout; -Z would shuffle (not needed)
-        let child = Command::new("mpg123")
-            .arg("-q")
-            .arg("--loop")
-            .arg("-1")
-            .arg(mp3_path)
+        // Two-phase audio pipeline fed into a single aplay process:
+        //   Phase 1: first play fades in over 3 seconds via sox
+        //   Phase 2: subsequent loops play at full volume (no sox overhead)
+        // A subshell groups the decode stages so aplay sees one continuous stream.
+        let mut cmd = format!(
+            concat!(
+                "(mpg123 -s -r 48000 --stereo '{}' 2>/dev/null",
+                " | sox -t raw -r 48000 -c 2 -e signed-integer -b 16 -L -",
+                " -t raw -e signed-integer -b 16 -L - fade t 3;",
+                " while true; do",
+                " mpg123 -s -r 48000 --stereo '{}' 2>/dev/null;",
+                " done)",
+                " | aplay -D all_speakers -f S16_LE -r 48000 -c 2 2>/dev/null"
+            ),
+            mp3_path, mp3_path
+        );
+        let mut process = Command::new("sh");
+        if let Some(path) = volume_state_file {
+            cmd = cmd.replace(" | aplay -D", " | \"$WHITE_NOISE_GAIN_PROGRAM\" --pcm_gain_state_file \"$WHITE_NOISE_GAIN_STATE\" | aplay -D");
+            process
+                .env("WHITE_NOISE_GAIN_PROGRAM", std::env::current_exe()?)
+                .env("WHITE_NOISE_GAIN_STATE", path);
+        }
+        let child = process
+            .arg("-c")
+            .arg(&cmd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| "failed to spawn mpg123 (is it installed?)")?;
+            .with_context(|| "failed to spawn mpg123|aplay pipeline")?;
 
-        info!("Started mpg123 (PID {})", child.id());
+        info!("Started audio pipeline with fade-in (PID {})", child.id());
         self.child = Some(child);
         Ok(())
     }
 
     fn stop(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
-            info!("Stopping mpg123 (PID {})", child.id());
-            // Attempt to terminate the process. If this fails, fall back to force kill.
-            if child.kill().is_err() {
-                warn!("Failed to send kill signal to mpg123");
+            let pid = child.id();
+            info!("Stopping audio pipeline (PID {})", pid);
+            // Kill all child processes of the shell first
+            let _ = Command::new("pkill")
+                .arg("-P")
+                .arg(pid.to_string())
+                .status();
+            // Then kill the shell itself
+            if let Err(error) = child.kill() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return Ok(());
+                }
+                // Preserve the handle rather than claiming OFF or blocking on
+                // wait() for a process that could still be playing.
+                self.child = Some(child);
+                return Err(error).context("failed to terminate audio pipeline shell");
             }
             let _ = child.wait();
         } else {
-            debug!("stop requested, but no running mpg123 child");
+            debug!("stop requested, but no running audio pipeline");
         }
         Ok(())
     }
@@ -211,11 +262,34 @@ fn random_suffix(n: usize) -> String {
         .collect()
 }
 
+fn player_topics(base: &str) -> Result<(String, String, String)> {
+    if !matches!(
+        base,
+        "appliances/white-noise/florencesroom" | "appliances/white-noise/masterbedroom"
+    ) {
+        return Err(anyhow!("unsupported appliance topic base"));
+    }
+    Ok((
+        format!("{base}/set"),
+        format!("{base}/state"),
+        format!("{base}/availability"),
+    ))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli: Vec<_> = std::env::args_os().collect();
+    if cli.len() == 3 && cli[1] == "--pcm_gain_state_file" {
+        return volume::pcm(std::path::Path::new(&cli[2]));
+    }
     env_logger::init();
     let args = Args::parse();
-    info!("Starting with args: {:?}", args);
+    let mut noise_volume = args
+        .volume_state_file
+        .as_ref()
+        .map(|path| volume::Controller::open(std::path::Path::new(path)))
+        .transpose()?;
+    info!("Starting white-noise player {}", args.device_id);
 
     // Quick pre-flight: ensure mpg123 is available
     let which = Command::new("which")
@@ -232,21 +306,29 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Topics
-    let base = format!("homeassistant");
-    let availability_topic = format!("{}/{}", base, format!("{}/availability", args.device_id));
+    // Quick pre-flight: ensure sox is available (used for fade-in)
+    let which_sox = Command::new("which")
+        .arg("sox")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match which_sox {
+        Ok(st) if st.success() => debug!("sox found"),
+        _ => {
+            return Err(anyhow!(
+                "sox was not found in PATH. Install it (e.g. `sudo apt install sox`)."
+            ));
+        }
+    }
+
+    // Home Assistant discovery is metadata only; all appliance traffic is separate.
+    let (command_topic, state_topic, availability_topic) = player_topics(&args.topic_base)?;
+    let volume_command_topic = format!("{}/volume/set", args.topic_base);
+    let volume_state_topic = format!("{}/volume/state", args.topic_base);
     let switch_object_id = "white_noise";
-    let command_topic = format!(
-        "{}/switch/{}/{}/set",
-        base, args.device_id, switch_object_id
-    );
-    let state_topic = format!(
-        "{}/switch/{}/{}/state",
-        base, args.device_id, switch_object_id
-    );
     let config_topic = format!(
-        "{}/switch/{}/{}/config",
-        base, args.device_id, switch_object_id
+        "homeassistant/switch/{}/{}/config",
+        args.device_id, switch_object_id
     );
 
     // MQTT options with LWT
@@ -312,11 +394,36 @@ async fn main() -> Result<()> {
     // But for simplicity, we’ll just run the loop inline here.
     // When connected, publish discovery + availability + initial state.
 
-    // Subscribe once after (first) connect
-    let mut subscribed = false;
+    // MQTT reconnection must not change playback. Observe the process independently
+    // so an unexpected exit cannot leave a retained ON state indefinitely.
+    let mut last_running: Option<bool> = None;
+    let mut broker_connected = false;
+    let mut process_check = tokio::time::interval(Duration::from_secs(1));
 
     loop {
-        match eventloop.poll().await {
+        let event = tokio::select! {
+            event = eventloop.poll() => Some(event),
+            _ = process_check.tick() => None,
+        };
+        let Some(event) = event else {
+            if let Some(controller) = noise_volume.as_ref().filter(|_| broker_connected) {
+                // Never block the event loop on a full queue while disconnected.
+                // The next tick/reconnect reports the same device-owned setting.
+                let _ = client.try_publish(
+                    &volume_state_topic,
+                    QoS::AtLeastOnce,
+                    true,
+                    controller.report(&controller.setting.operation_id, "confirmed"),
+                );
+            }
+            let running = player.lock().unwrap().is_running();
+            if last_running != Some(running) {
+                pub_retained(&client, &state_topic, if running { "ON" } else { "OFF" }).await?;
+                last_running = Some(running);
+            }
+            continue;
+        };
+        match event {
             Ok(Event::Incoming(incoming)) => {
                 // Debug trace
                 debug!("Incoming: {:?}", incoming);
@@ -324,20 +431,32 @@ async fn main() -> Result<()> {
                 use rumqttc::Packet::*;
                 match incoming {
                     ConnAck(_) => {
+                        broker_connected = true;
                         info!("Connected to MQTT broker");
 
                         // Online
                         pub_retained(&client, &availability_topic, "online").await?;
                         // Discovery config
                         pub_retained(&client, &config_topic, &cfg_json).await?;
-                        // Initial state OFF (retained)
-                        pub_retained(&client, &state_topic, "OFF").await?;
+                        // Reconnection reports actual playback; it never starts/stops it.
+                        let running = player.lock().unwrap().is_running();
+                        pub_retained(&client, &state_topic, if running { "ON" } else { "OFF" })
+                            .await?;
+                        last_running = Some(running);
 
                         // Subscribe to commands
-                        if !subscribed {
-                            info!("Subscribing to {}", command_topic);
-                            client.subscribe(&command_topic, QoS::AtLeastOnce).await?;
-                            subscribed = true;
+                        info!("Subscribing to {}", command_topic);
+                        client.subscribe(&command_topic, QoS::AtLeastOnce).await?;
+                        if let Some(controller) = &noise_volume {
+                            pub_retained(
+                                &client,
+                                &volume_state_topic,
+                                &controller.report(&controller.setting.operation_id, "confirmed"),
+                            )
+                            .await?;
+                            client
+                                .subscribe(&volume_command_topic, QoS::AtLeastOnce)
+                                .await?;
                         }
                     }
                     Publish(p) => {
@@ -345,19 +464,45 @@ async fn main() -> Result<()> {
                         let payload = String::from_utf8_lossy(&p.payload).to_string();
                         debug!("Publish on {} -> {}", topic, payload);
 
-                        if topic == command_topic {
+                        if topic == volume_command_topic && !p.retain {
+                            if let Some(controller) = &mut noise_volume {
+                                if let Some(report) = controller.receive(
+                                    &payload,
+                                    p.retain,
+                                    volume::now_ms(),
+                                    player.lock().unwrap().is_running(),
+                                ) {
+                                    pub_retained(&client, &volume_state_topic, &report).await?;
+                                } else {
+                                    warn!("Invalid noise volume command");
+                                }
+                            }
+                        }
+
+                        if topic == command_topic && !p.retain {
                             let cmd = payload.trim().to_ascii_uppercase();
                             match cmd.as_str() {
                                 "ON" => {
                                     info!("Command: ON -> start white noise");
                                     let mut pl = player.lock().unwrap();
-                                    if let Err(e) = pl.start(&player_mp3) {
+                                    if !pl.is_running() {
+                                        if let Some(controller) = &mut noise_volume {
+                                            if let Err(e) = controller.reset_for_playback() {
+                                                error!("Cannot restore normal noise gain before ON: {e:#}");
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    if let Err(e) =
+                                        pl.start(&player_mp3, args.volume_state_file.as_deref())
+                                    {
                                         error!("Failed to start mpg123: {e:#}");
                                     } else {
                                         client
                                             .publish(&state_topic, QoS::AtLeastOnce, true, "ON")
                                             .await
                                             .ok();
+                                        last_running = Some(true);
                                     }
                                 }
                                 "OFF" => {
@@ -365,11 +510,13 @@ async fn main() -> Result<()> {
                                     let mut pl = player.lock().unwrap();
                                     if let Err(e) = pl.stop() {
                                         error!("Failed to stop mpg123: {e:#}");
+                                    } else {
+                                        client
+                                            .publish(&state_topic, QoS::AtLeastOnce, true, "OFF")
+                                            .await
+                                            .ok();
+                                        last_running = Some(false);
                                     }
-                                    client
-                                        .publish(&state_topic, QoS::AtLeastOnce, true, "OFF")
-                                        .await
-                                        .ok();
                                 }
                                 other => {
                                     warn!("Unknown command payload: {}", other);
@@ -392,6 +539,7 @@ async fn main() -> Result<()> {
                 }
             }
             Err(e) => {
+                broker_connected = false;
                 error!("MQTT event loop error: {e:#}");
                 // Backoff to avoid hot loop
                 sleep(Duration::from_secs(2)).await;
@@ -401,4 +549,66 @@ async fn main() -> Result<()> {
 
     #[allow(unreachable_code)]
     Ok(())
+}
+
+#[cfg(test)]
+mod topic_tests {
+    use super::*;
+
+    #[test]
+    fn separate_room_topics() {
+        for room in ["florencesroom", "masterbedroom"] {
+            let base = format!("appliances/white-noise/{room}");
+            let (command, state, availability) = player_topics(&base).unwrap();
+            assert_eq!(command, format!("{base}/set"));
+            assert_eq!(state, format!("{base}/state"));
+            assert_eq!(availability, format!("{base}/availability"));
+            assert!(!command.starts_with("homeassistant/"));
+        }
+    }
+
+    #[test]
+    fn reject_legacy_unknown_or_wildcard_topics() {
+        for base in [
+            "homeassistant",
+            "appliances/white-noise/+",
+            "appliances/white-noise/#",
+            "appliances/white-noise/babyboy",
+            "appliances/white-noise/florencesroom/",
+        ] {
+            assert!(player_topics(base).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests never connect to MQTT or invoke mpg123.
+    #[test]
+    fn an_empty_player_reports_not_running() {
+        assert!(!Player::new().is_running());
+    }
+
+    #[test]
+    fn an_exited_inert_process_is_detected_without_playback() {
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        child.wait().unwrap();
+        let mut player = Player { child: Some(child) };
+        assert!(!player.is_running());
+        assert!(player.child.is_none());
+    }
+
+    #[test]
+    fn broker_addresses_preserve_the_explicit_port() {
+        assert_eq!(
+            parse_host_port("broker.invalid:1884"),
+            ("broker.invalid".to_string(), 1884)
+        );
+        assert_eq!(
+            parse_host_port("broker.invalid"),
+            ("broker.invalid".to_string(), 1883)
+        );
+    }
 }
