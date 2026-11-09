@@ -42,10 +42,14 @@ def main():
     parser.add_argument("--authorize-maintenance", action="store_true", required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--sha256", required=True)
+    parser.add_argument("--allow-nightstand-degraded", action="store_true",
+                        help="Use the explicitly commissioned one-speaker noise routing preflight")
     args = parser.parse_args()
     host = socket.gethostname().split(".")[0]
     if os.geteuid() != 0 or host not in HOSTS:
         raise RuntimeError("Wrong host/account")
+    if args.allow_nightstand_degraded and host != "nightstand-masterbedroom":
+        raise RuntimeError("Degraded routing is only supported on Nightstand")
     room, source_root, user = HOSTS[host]
     base = "appliances/white-noise/" + room
     candidate = args.artifacts / "white-noise-machine"
@@ -77,7 +81,15 @@ def main():
     if host == "nightstand-masterbedroom":
         # A running idle controller can hide a USB disconnect since its last
         # startup. Check the existing identity gate before stopping it.
-        run("/usr/local/libexec/nightstand-audio-verify", "--identify")
+        if args.allow_nightstand_degraded:
+            routing_override = unit.parent / "white-noise.service.d/35-degraded-noise.conf"
+            expected_override = ("[Service]\nEnvironment=NIGHTSTAND_NOISE_DEGRADED=1\n"
+                                 "ExecStartPre=\nExecStartPre=/usr/local/libexec/nightstand-noise-route --identify\n")
+            if not routing_override.exists() or routing_override.read_text() != expected_override:
+                raise RuntimeError("Explicit degraded routing has not been commissioned")
+            run("/usr/local/libexec/nightstand-noise-route", "--identify")
+        else:
+            run("/usr/local/libexec/nightstand-audio-verify", "--identify")
     run("systemctl", "is-active", "--quiet", "white-noise.service")
     idle()
     if retained(base + "/state") != "OFF":
